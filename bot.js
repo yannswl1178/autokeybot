@@ -296,6 +296,10 @@ async function registerCommands() {
           .setDescription("要賦予金鑰的使用者")
           .setRequired(true)
       )
+      .toJSON(),
+    new SlashCommandBuilder()
+      .setName("setup")
+      .setDescription("重新發送控制面板至 get-key 頻道（管理員專用）")
       .toJSON()
   ];
 
@@ -353,11 +357,11 @@ async function sendControlPanel(channel) {
       `**新用戶**\n` +
       `請前往 <#${DOWNLOAD_CHANNEL_ID}> 下載程式，並使用獲得的金鑰啟動。\n\n` +
       `**使用方式**\n` +
-      `1. 前往 [get 連點key 下載](${DOWNLOAD_LINK}) 下載程式\n` +
+      `1. 前往 ${DOWNLOAD_LINK} 下載程式\n` +
       `2. 將 \`1ynkeycheck.exe\` 和 \`yy_clicker.exe\` 放在同一資料夾\n` +
-      `3. 前往 [get-key](${GETKEY_LINK}) 點選【兌換密鑰】再按下 取得金鑰匙\n` +
+      `3. 前往 ${GETKEY_LINK} 點選【兌換密鑰】再按下 取得金鑰匙\n` +
       `4. 開啟 \`1ynkeycheck.exe\`\n` +
-      `5. 輸入 [get-key](${GETKEY_LINK}) 獲得的【金鑰匙】`
+      `5. 輸入 ${GETKEY_LINK} 獲得的【金鑰匙】`
     )
     .setFooter({ text: "1yn autogetkey" })
     .setTimestamp();
@@ -398,6 +402,31 @@ async function sendControlPanel(channel) {
 // ======================================================================
 client.on(Events.InteractionCreate, async (interaction) => {
   if (isInteractionProcessed(interaction.id)) return;
+
+  // ── Slash Command: /setup ──
+  if (interaction.isChatInputCommand() && interaction.commandName === "setup") {
+    const member = interaction.member;
+    if (!member.roles.cache.has(ADMIN_ROLE_ID)) {
+      return interaction.reply({
+        content: "❌ 您沒有權限使用此指令。僅限管理員使用。",
+        ephemeral: true
+      });
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+      const channel = await client.channels.fetch(GETKEY_CHANNEL_ID);
+      if (!channel) {
+        return interaction.editReply({ content: "❌ 找不到 get-key 頻道。" });
+      }
+      await sendControlPanel(channel);
+      return interaction.editReply({ content: "✅ 控制面板已重新發送至 get-key 頻道！" });
+    } catch (err) {
+      console.error("[setup] 發送控制面板失敗:", err.message);
+      return interaction.editReply({ content: `❌ 發送失敗：${err.message}` });
+    }
+  }
 
   // ── Slash Command: /giveautoclick ──
   if (interaction.isChatInputCommand() && interaction.commandName === "giveautoclick") {
@@ -458,11 +487,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
           `恭喜！管理員已為您分配了一組專屬金鑰。\n\n` +
           `**您的金鑰：**\n\`\`\`\n${key}\n\`\`\`\n\n` +
           `**使用方式：**\n` +
-          `前往 [get 連點key 下載](${DOWNLOAD_LINK}) 下載程式\n` +
+          `前往 ${DOWNLOAD_LINK} 下載程式\n` +
           `將 \`1ynkeycheck.exe\` 和 \`yy_clicker.exe\` 放在同一資料夾\n` +
-          `前往 [get-key](${GETKEY_LINK}) 點選【兌換密鑰】再按下 取得金鑰匙\n` +
+          `前往 ${GETKEY_LINK} 點選【兌換密鑰】再按下 取得金鑰匙\n` +
           `開啟 \`1ynkeycheck.exe\`\n` +
-          `輸入 [get-key](${GETKEY_LINK}) 獲得的【金鑰匙】\n\n` +
+          `輸入 ${GETKEY_LINK} 獲得的【金鑰匙】\n\n` +
           `⚠ 請妥善保管此金鑰，切勿分享給他人。\n` +
           `⚠ 金鑰會綁定您的電腦硬體（HWID），如需更換電腦請在 Discord 重置 HWID。\n` +
           `⚠ 程式首次啟動時會在資料夾中建立 \`checkHWID\` 資料夾，請勿刪除。`
@@ -540,11 +569,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
               `**HWID：** ${keyData.hwid ? "✅ 已綁定" : "⏳ 未綁定"}\n` +
               `**建立時間：** ${keyData.createdAt}\n\n` +
               `**使用方式：**\n` +
-              `前往 [get 連點key 下載](${DOWNLOAD_LINK}) 下載程式\n` +
+              `前往 ${DOWNLOAD_LINK} 下載程式\n` +
               `將 \`1ynkeycheck.exe\` 和 \`yy_clicker.exe\` 放在同一資料夾\n` +
-              `前往 [get-key](${GETKEY_LINK}) 點選【兌換密鑰】再按下 取得金鑰匙\n` +
+              `前往 ${GETKEY_LINK} 點選【兌換密鑰】再按下 取得金鑰匙\n` +
               `開啟 \`1ynkeycheck.exe\`\n` +
-              `輸入 [get-key](${GETKEY_LINK}) 獲得的【金鑰匙】`
+              `輸入 ${GETKEY_LINK} 獲得的【金鑰匙】`
             )
             .setFooter({ text: "1yn autogetkey" })
             .setTimestamp();
