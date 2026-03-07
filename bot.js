@@ -251,7 +251,7 @@ async function loadKeysFromSheet() {
           const keyData = {
             userId: k.user_id,
             username: k.username || "unknown",
-            redeemed: k.status === "已兌換" || k.status === "已建立",
+            redeemed: k.status === "已兌換",
             hwid: k.hwid || null,
             machineCode: k.machine_code || null,
             createdAt: k.created_at || k.timestamp || new Date().toISOString()
@@ -660,16 +660,34 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   // ── Modal 提交：兌換密鑰 ──
   if (interaction.isModalSubmit() && interaction.customId === "modal_redeem_key") {
-    const inputKey = interaction.fields.getTextInputValue("input_key").trim().toUpperCase();
+    const rawInput = interaction.fields.getTextInputValue("input_key");
+    const inputKey = rawInput.trim().toUpperCase().replace(/\s+/g, "");
+
+    console.log(`[兌換] 用戶 ${interaction.user.username} (${interaction.user.id}) 輸入金鑰: ${inputKey}`);
+    console.log(`[兌換] keyStore 大小: ${keyStore.size}, 包含此金鑰: ${keyStore.has(inputKey)}`);
 
     if (!keyStore.has(inputKey)) {
-      return interaction.reply({
-        content: "❌ 金鑰無效！請確認您輸入的金鑰是否正確。",
-        ephemeral: true
-      });
+      // 嘗試遍歷 keyStore 找到匹配的金鑰（防止空格/格式差異）
+      let matchedKey = null;
+      for (const [storedKey] of keyStore) {
+        if (storedKey.replace(/\s+/g, "").toUpperCase() === inputKey) {
+          matchedKey = storedKey;
+          break;
+        }
+      }
+      if (!matchedKey) {
+        console.log(`[兌換] 金鑰不存在。keyStore 中的金鑰: ${[...keyStore.keys()].map(k => k.substring(0, 12) + "...").join(", ")}`);
+        return interaction.reply({
+          content: "❌ 金鑰無效！請確認您輸入的金鑰是否正確。",
+          ephemeral: true
+        });
+      }
+      // 使用匹配到的金鑰
+      console.log(`[兌換] 透過遍歷找到匹配金鑰: ${matchedKey}`);
     }
 
-    const keyData = keyStore.get(inputKey);
+    const actualKey = keyStore.has(inputKey) ? inputKey : [...keyStore.keys()].find(k => k.replace(/\s+/g, "").toUpperCase() === inputKey);
+    const keyData = keyStore.get(actualKey);
 
     if (keyData.userId !== interaction.user.id) {
       return interaction.reply({ content: "❌ 此金鑰不屬於您。", ephemeral: true });
@@ -680,7 +698,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     keyData.redeemed = true;
-    keyStore.set(inputKey, keyData);
+    keyStore.set(actualKey, keyData);
 
     try {
       const member = await interaction.guild.members.fetch(interaction.user.id);
@@ -691,8 +709,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     await sendUserDataToSheet(interaction.user.username, interaction.user.id, "autoclick（金鑰兌換）", "1500 tokens");
 
+    // 更新 Google Sheets 中的金鑰狀態為已兌換
+    await saveKeyToSheet(actualKey, interaction.user.username, interaction.user.id, "已兌換", keyData.hwid || "", keyData.machineCode || "");
+
     return interaction.reply({
-      content: `✅ 金鑰兌換成功！\n\n您的金鑰：\`${inputKey}\`\n已獲得 autoclick 身分組。\n\n請使用此金鑰在 \`1ynkeycheck.exe\` 啟動器中啟動程式。`,
+      content: `✅ 金鑰兌換成功！\n\n您的金鑰：\`${actualKey}\`\n已獲得 autoclick 身分組。\n\n請使用此金鑰在 \`1ynkeycheck.exe\` 啟動器中啟動程式。`,
       ephemeral: true
     });
   }
