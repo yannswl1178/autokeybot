@@ -1,0 +1,17 @@
+{
+  "name": "autokeybot",
+  "version": "1.0.0",
+  "description": "1yn autogetkey - Discord 金鑰管理 Bot",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "node-fetch": "^2.7.0",
+    "uuid": "^9.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
