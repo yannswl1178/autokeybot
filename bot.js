@@ -115,7 +115,7 @@ function generateLicenseKey(secretKey, userId) {
 // ======================================================================
 // secretStore: Map<secretKey, { userId, username, redeemed, licenseKey, createdAt }>
 const secretStore = new Map();
-// licenseStore: Map<licenseKey, { userId, username, secretKey, hwid, machineCode, createdAt }>
+// licenseStore: Map<licenseKey, { userId, username, secretKey, hwid, machineCode, sessionToken, createdAt }>
 const licenseStore = new Map();
 // userSecretMap: Map<userId, secretKey>
 const userSecretMap = new Map();
@@ -239,6 +239,33 @@ async function resetHwidOnSheet(licenseKey) {
 }
 
 /**
+ * 更新 session_token 至 Google Sheets
+ */
+async function updateSessionOnSheet(licenseKey, encryptedHwid, machineCode, sessionToken) {
+  try {
+    const payload = {
+      type: "hwid_update",
+      key: licenseKey,
+      hwid: encryptedHwid || "",
+      machine_code: machineCode || "",
+      session_token: sessionToken || "",
+      timestamp: new Date().toISOString()
+    };
+    console.log(`[試算表] 更新 Session Token: ${licenseKey.substring(0, 8)}...`);
+    const response = await fetch(GOOGLE_SCRIPT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      redirect: "follow"
+    });
+    const result = await response.text();
+    console.log(`[試算表] Session Token 更新回應: ${result}`);
+  } catch (err) {
+    console.error(`[試算表] Session Token 更新失敗:`, err.message);
+  }
+}
+
+/**
  * 從 Google Sheets 載入所有金鑰（Bot 啟動時呼叫）
  */
 async function loadKeysFromSheet() {
@@ -267,6 +294,7 @@ async function loadKeysFromSheet() {
         const redeemed = k.status === "已兌換";
         const hwid = k.hwid || null;
         const mc = k.machine_code || null;
+        const sessionToken = k.session_token || null;
         const createdAt = k.created_at || k.timestamp || new Date().toISOString();
 
         // 載入密鑰
@@ -289,6 +317,7 @@ async function loadKeysFromSheet() {
             secretKey: sKey,
             hwid,
             machineCode: mc,
+            sessionToken,
             createdAt
           });
           userLicenseMap.set(userId, lKey);
@@ -303,6 +332,7 @@ async function loadKeysFromSheet() {
             secretKey: "",
             hwid,
             machineCode: mc,
+            sessionToken,
             createdAt
           });
           userLicenseMap.set(userId, sKey);
@@ -886,10 +916,10 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // POST /api/verify-hwid — 驗證 checkHWID 資料夾中的機碼
+  // POST /api/verify-hwid — 驗證 checkHWID 資料夾中的機碼 + session_token
   if (method === "POST" && url.pathname === "/api/verify-hwid") {
     const body = await parseBody(req);
-    const { key, hwid_hash, machine_code } = body;
+    const { key, hwid_hash, machine_code, session_token } = body;
 
     if (!key || !hwid_hash || !machine_code) {
       return sendJson(res, 400, { valid: false, message: "缺少必要參數" });
@@ -915,10 +945,52 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 403, { valid: false, message: "機碼驗證失敗" });
     }
 
+    // Session Token 驗證（如果伺服器端有存 session_token）
+    if (licenseData.sessionToken && session_token) {
+      if (licenseData.sessionToken !== session_token) {
+        console.log(`[API] Session Token 不匹配: ${normalizedKey.substring(0, 8)}... (expected: ${licenseData.sessionToken.substring(0, 8)}..., got: ${session_token.substring(0, 8)}...)`);
+        return sendJson(res, 403, { valid: false, message: "Session Token 不匹配，可能已被複製到其他電腦" });
+      }
+    }
+
     return sendJson(res, 200, {
       valid: true,
       message: "HWID 驗證成功",
       username: licenseData.username
+    });
+  }
+
+  // POST /api/update-session — 更新 session_token（launcher 在綁定 HWID 時呼叫）
+  if (method === "POST" && url.pathname === "/api/update-session") {
+    const body = await parseBody(req);
+    const { key, hwid_hash, machine_code, session_token } = body;
+
+    if (!key || !session_token) {
+      return sendJson(res, 400, { valid: false, message: "缺少必要參數" });
+    }
+
+    const normalizedKey = key.trim().toUpperCase();
+
+    if (!licenseStore.has(normalizedKey)) {
+      return sendJson(res, 404, { valid: false, message: "金鑰無效" });
+    }
+
+    const licenseData = licenseStore.get(normalizedKey);
+
+    // 更新 session_token
+    licenseData.sessionToken = session_token;
+    if (hwid_hash) licenseData.hwid = hwid_hash;
+    if (machine_code) licenseData.machineCode = machine_code;
+    licenseStore.set(normalizedKey, licenseData);
+
+    // 同步到 Google Sheets
+    await updateSessionOnSheet(normalizedKey, hwid_hash || licenseData.hwid, machine_code || licenseData.machineCode, session_token);
+
+    console.log(`[API] Session Token 已更新: ${normalizedKey.substring(0, 8)}... token=${session_token.substring(0, 8)}...`);
+
+    return sendJson(res, 200, {
+      valid: true,
+      message: "Session Token 已更新"
     });
   }
 
@@ -938,7 +1010,8 @@ const server = http.createServer(async (req, res) => {
       licenses.push({
         license_prefix: key.substring(0, 12) + "...",
         username: data.username,
-        hwid: data.hwid ? "已綁定" : "未綁定"
+        hwid: data.hwid ? "已綁定" : "未綁定",
+        session_token: data.sessionToken ? "已設定" : "未設定"
       });
     }
     return sendJson(res, 200, {
