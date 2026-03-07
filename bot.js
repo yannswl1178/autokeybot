@@ -41,7 +41,7 @@ const TOKEN            = process.env.DISCORD_TOKEN || "";
 const GUILD_ID         = process.env.GUILD_ID || "";
 
 // Google Apps Script URL（硬編碼）
-const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzYuhMP0wjGO_u0dEo3z7o-neg8KcuTJCsCAgrJ6_PF4hxKdEDjj4m8nRf24dYOhUKbFQ/exec";
+const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxTj4GejwJge1GXolh_CiX3sgiGnzZMcAdK9yGwm8oYBya1DSv7VK4ApjBkUQXRUxIMSA/exec";
 
 // 頻道 ID
 const GETKEY_CATEGORY_ID  = "1479754371297181736";
