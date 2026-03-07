@@ -531,61 +531,92 @@ client.on(Events.InteractionCreate, async (interaction) => {
 // 金鑰驗證 API（供 .cmd 腳本呼叫）
 // ======================================================================
 // 這個 API 端點讓 C++ 客戶端或 .cmd 腳本可以驗證金鑰
-// 透過 Express 伺服器提供
-const express = require("express");
-const app = express();
+// 使用 Node.js 內建 http 模組（無需額外安裝 express）
+const http = require("http");
 const API_PORT = process.env.PORT || 3000;
 
-app.use(express.json());
+// 輔助函式：解析 JSON body
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", chunk => { body += chunk; });
+    req.on("end", () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (e) {
+        resolve({});
+      }
+    });
+    req.on("error", reject);
+  });
+}
 
-app.get("/", (req, res) => {
-  res.json({ status: "ok", message: "1yn autogetkey bot is running" });
-});
+// 輔助函式：發送 JSON 回應
+function sendJson(res, statusCode, data) {
+  res.writeHead(statusCode, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(data));
+}
 
-app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
-});
+// 建立 HTTP 伺服器
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const method = req.method;
 
-// 驗證金鑰端點
-app.post("/api/verify-key", (req, res) => {
-  const { key, hwid } = req.body;
-
-  if (!key) {
-    return res.status(400).json({ valid: false, message: "未提供金鑰" });
+  // GET /
+  if (method === "GET" && url.pathname === "/") {
+    return sendJson(res, 200, { status: "ok", message: "1yn autogetkey bot is running" });
   }
 
-  const normalizedKey = key.trim().toUpperCase();
-
-  if (!keyStore.has(normalizedKey)) {
-    return res.status(404).json({ valid: false, message: "金鑰無效" });
+  // GET /health
+  if (method === "GET" && url.pathname === "/health") {
+    return sendJson(res, 200, { status: "ok" });
   }
 
-  const keyData = keyStore.get(normalizedKey);
+  // POST /api/verify-key
+  if (method === "POST" && url.pathname === "/api/verify-key") {
+    const body = await parseBody(req);
+    const { key, hwid } = body;
 
-  // HWID 綁定檢查
-  if (keyData.hwid && hwid && keyData.hwid !== hwid) {
-    return res.status(403).json({
-      valid: false,
-      message: "此金鑰已綁定至其他裝置。請在 Discord 重置 HWID。"
+    if (!key) {
+      return sendJson(res, 400, { valid: false, message: "未提供金鑰" });
+    }
+
+    const normalizedKey = key.trim().toUpperCase();
+
+    if (!keyStore.has(normalizedKey)) {
+      return sendJson(res, 404, { valid: false, message: "金鑰無效" });
+    }
+
+    const keyData = keyStore.get(normalizedKey);
+
+    // HWID 綁定檢查
+    if (keyData.hwid && hwid && keyData.hwid !== hwid) {
+      return sendJson(res, 403, {
+        valid: false,
+        message: "此金鑰已綁定至其他裝置。請在 Discord 重置 HWID。"
+      });
+    }
+
+    // 如果尚未綁定 HWID，進行綁定
+    if (!keyData.hwid && hwid) {
+      keyData.hwid = hwid;
+      keyStore.set(normalizedKey, keyData);
+    }
+
+    return sendJson(res, 200, {
+      valid: true,
+      message: "金鑰驗證成功",
+      username: keyData.username,
+      userId: keyData.userId
     });
   }
 
-  // 如果尚未綁定 HWID，進行綁定
-  if (!keyData.hwid && hwid) {
-    keyData.hwid = hwid;
-    keyStore.set(normalizedKey, keyData);
-  }
-
-  return res.json({
-    valid: true,
-    message: "金鑰驗證成功",
-    username: keyData.username,
-    userId: keyData.userId
-  });
+  // 404 for all other routes
+  sendJson(res, 404, { error: "Not found" });
 });
 
 // 啟動 API 伺服器
-app.listen(API_PORT, "0.0.0.0", () => {
+server.listen(API_PORT, "0.0.0.0", () => {
   console.log(`[API] 金鑰驗證伺服器已啟動，監聽 port ${API_PORT}`);
 });
 
