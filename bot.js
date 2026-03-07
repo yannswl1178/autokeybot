@@ -3,24 +3,14 @@
  * 
  * 功能：
  *   1. /giveautoclick @使用者 — 管理員/代理賦予金鑰給指定使用者
- *   2. 兌換金鑰 按鈕 — 使用者輸入金鑰兌換 autoclick 身分組
+ *   2. 兌換密鑰 按鈕 — 使用者輸入金鑰兌換 autoclick 身分組
  *   3. 獲取金鑰 按鈕 — 使用者點擊後獲取已分配的金鑰（私訊發送）
  *   4. 獲取身分組 按鈕 — 檢查並賦予 autoclick 身分組
- *   5. 重置 HWID 按鈕 — 重置硬體綁定
+ *   5. 重置 HWID 按鈕 — 重置硬體綁定（清除 Google Sheets 中的 HWID 記錄）
  *   6. 查看統計 按鈕 — 查看個人金鑰狀態
  *
- * 環境變數：
- *   - DISCORD_TOKEN        : Bot Token
- *   - GOOGLE_SCRIPT_URL    : Google Apps Script Web App URL（統一端點）
- *   - GUILD_ID             : 伺服器 ID（用於註冊指令）
- *
- * 頻道/角色 ID：
- *   - get key 類別：1479754371297181736
- *   - get key 頻道：1479754386568646746
- *   - 下載頻道：    1479754434547417208
- *   - autoclick 身分組：1479785119547002931
- *   - 管理員身分組：    1479780178069815447
- *   - 代理身分組：      1479780213599506463
+ * 金鑰永久儲存：所有金鑰都保存在 Google Sheets，Bot 重啟時從 Sheets 載入
+ * HWID 系統：加密 HWID + 機碼寫入 checkHWID 資料夾 + 同步至 Google Sheets
  */
 
 const {
@@ -42,47 +32,80 @@ const {
 
 const fetch = require("node-fetch");
 const { v4: uuidv4 } = require("uuid");
+const crypto = require("crypto");
 
 // ======================================================================
 // 設定
 // ======================================================================
 const TOKEN            = process.env.DISCORD_TOKEN || "";
-const GOOGLE_SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL || "";
 const GUILD_ID         = process.env.GUILD_ID || "";
 
+// Google Apps Script URL（硬編碼）
+const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzYuhMP0wjGO_u0dEo3z7o-neg8KcuTJCsCAgrJ6_PF4hxKdEDjj4m8nRf24dYOhUKbFQ/exec";
+
 // 頻道 ID
-const GETKEY_CATEGORY_ID = "1479754371297181736";
-const GETKEY_CHANNEL_ID  = "1479754386568646746";
+const GETKEY_CATEGORY_ID  = "1479754371297181736";
+const GETKEY_CHANNEL_ID   = "1479754386568646746";
 const DOWNLOAD_CHANNEL_ID = "1479754434547417208";
 
 // 角色 ID
-const AUTOCLICK_ROLE_ID  = "1479785119547002931";
-const ADMIN_ROLE_ID      = "1479780178069815447";
-const AGENT_ROLE_ID      = "1479780213599506463";
+const AUTOCLICK_ROLE_ID = "1479785119547002931";
+const ADMIN_ROLE_ID     = "1479780178069815447";
+const AGENT_ROLE_ID     = "1479780213599506463";
+
+// Discord 頻道連結
+const DOWNLOAD_LINK = "https://discord.com/channels/1479753380661428409/1479754434547417208";
+const GETKEY_LINK   = "https://discord.com/channels/1479753380661428409/1479754386568646746";
 
 // ======================================================================
-// 金鑰資料庫（記憶體內，重啟會清除 — 生產環境建議用資料庫）
-// 結構：Map<key_string, { userId, username, redeemed, hwid, createdAt }>
+// HWID 加密系統
+// ======================================================================
+const HWID_SECRET = "1yn-autoclick-hwid-salt-v2-" + (process.env.HWID_SECRET || "s3cur3K3y!");
+
+/**
+ * 產生加密 HWID 雜湊（不可逆，用戶無法破解）
+ * 輸入：原始 HWID 字串（電腦名稱_使用者名稱_磁碟序號）
+ * 輸出：64 字元的 SHA-256 雜湊
+ */
+function encryptHWID(rawHwid) {
+  return crypto.createHmac("sha256", HWID_SECRET)
+    .update(rawHwid)
+    .digest("hex");
+}
+
+/**
+ * 產生機碼（Machine Code）— 綁定金鑰 + HWID 的唯一識別碼
+ * 這個機碼會寫入 checkHWID 資料夾的 JSON 檔案中
+ */
+function generateMachineCode(key, encryptedHwid) {
+  const payload = `${key}:${encryptedHwid}:${HWID_SECRET}`;
+  return crypto.createHash("sha512").update(payload).digest("hex").substring(0, 64);
+}
+
+/**
+ * 驗證機碼是否匹配
+ */
+function verifyMachineCode(key, encryptedHwid, machineCode) {
+  const expected = generateMachineCode(key, encryptedHwid);
+  return expected === machineCode;
+}
+
+// ======================================================================
+// 金鑰資料庫（記憶體 + Google Sheets 永久儲存）
 // ======================================================================
 const keyStore = new Map();
-// 使用者 → 金鑰 對應：Map<userId, key_string>
 const userKeyMap = new Map();
 
 // ======================================================================
-// 防重複互動處理（防止 Discord 重複觸發）
+// 防重複互動處理
 // ======================================================================
 const processedInteractions = new Set();
-const INTERACTION_EXPIRE_MS = 30000; // 30 秒後清除
+const INTERACTION_EXPIRE_MS = 30000;
 
 function isInteractionProcessed(interactionId) {
-  if (processedInteractions.has(interactionId)) {
-    return true;
-  }
+  if (processedInteractions.has(interactionId)) return true;
   processedInteractions.add(interactionId);
-  // 30 秒後自動清除
-  setTimeout(() => {
-    processedInteractions.delete(interactionId);
-  }, INTERACTION_EXPIRE_MS);
+  setTimeout(() => processedInteractions.delete(interactionId), INTERACTION_EXPIRE_MS);
   return false;
 }
 
@@ -95,70 +118,155 @@ function generateKey() {
 }
 
 // ======================================================================
-// 傳送用戶資料至 Google 試算表
+// Google Sheets API 函式
 // ======================================================================
-async function sendUserDataToSheet(username, userId, purchaseItem, purchaseAmount) {
-  if (!GOOGLE_SCRIPT_URL) {
-    console.log("[試算表] GOOGLE_SCRIPT_URL 未設定，跳過寫入");
-    return;
-  }
 
+/**
+ * 寫入用戶購買資料至 Google Sheets
+ */
+async function sendUserDataToSheet(username, userId, purchaseItem, purchaseAmount) {
   try {
     const payload = {
+      type: "user_data",
       username,
       user_id: userId,
       purchase_item: purchaseItem,
       purchase_amount: purchaseAmount,
       timestamp: new Date().toISOString()
     };
-
-    console.log(`[試算表] 正在寫入: ${username} (${userId}) — ${purchaseItem}`);
-
+    console.log(`[試算表] 寫入用戶資料: ${username} (${userId})`);
     const response = await fetch(GOOGLE_SCRIPT_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       redirect: "follow"
     });
-
     const result = await response.text();
-    console.log(`[試算表] 回應: ${result}`);
+    console.log(`[試算表] 用戶資料回應: ${result}`);
   } catch (err) {
-    console.error(`[試算表] 寫入失敗:`, err.message);
+    console.error(`[試算表] 用戶資料寫入失敗:`, err.message);
   }
 }
 
-// ======================================================================
-// 傳送金鑰記錄至 Google 試算表
-// ======================================================================
-async function sendKeyDataToSheet(key, username, userId, status) {
-  if (!GOOGLE_SCRIPT_URL) {
-    console.log("[試算表] GOOGLE_SCRIPT_URL 未設定，跳過金鑰記錄寫入");
-    return;
-  }
-
+/**
+ * 寫入/更新金鑰至 Google Sheets（永久儲存）
+ */
+async function saveKeyToSheet(key, username, userId, status, hwid, machineCode) {
   try {
     const payload = {
+      type: "key_save",
       key,
       username,
       user_id: userId,
-      status,
+      status: status || "已建立",
+      hwid: hwid || "",
+      machine_code: machineCode || "",
       timestamp: new Date().toISOString()
     };
-
-    console.log(`[試算表] 正在寫入金鑰記錄: ${key} → ${username}`);
-
+    console.log(`[試算表] 儲存金鑰: ${key.substring(0, 8)}... → ${username}`);
     const response = await fetch(GOOGLE_SCRIPT_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       redirect: "follow"
     });
-
     const result = await response.text();
-    console.log(`[試算表] 金鑰記錄回應: ${result}`);
+    console.log(`[試算表] 金鑰儲存回應: ${result}`);
   } catch (err) {
-    console.error(`[試算表] 金鑰記錄寫入失敗:`, err.message);
+    console.error(`[試算表] 金鑰儲存失敗:`, err.message);
+  }
+}
+
+/**
+ * 更新 HWID 至 Google Sheets
+ */
+async function updateHwidOnSheet(key, encryptedHwid, machineCode) {
+  try {
+    const payload = {
+      type: "hwid_update",
+      key,
+      hwid: encryptedHwid,
+      machine_code: machineCode,
+      timestamp: new Date().toISOString()
+    };
+    console.log(`[試算表] 更新 HWID: ${key.substring(0, 8)}...`);
+    const response = await fetch(GOOGLE_SCRIPT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      redirect: "follow"
+    });
+    const result = await response.text();
+    console.log(`[試算表] HWID 更新回應: ${result}`);
+  } catch (err) {
+    console.error(`[試算表] HWID 更新失敗:`, err.message);
+  }
+}
+
+/**
+ * 重置 HWID（清除 Google Sheets 中的 HWID 記錄）
+ */
+async function resetHwidOnSheet(key) {
+  try {
+    const payload = {
+      type: "hwid_reset",
+      key,
+      timestamp: new Date().toISOString()
+    };
+    console.log(`[試算表] 重置 HWID: ${key.substring(0, 8)}...`);
+    const response = await fetch(GOOGLE_SCRIPT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      redirect: "follow"
+    });
+    const result = await response.text();
+    console.log(`[試算表] HWID 重置回應: ${result}`);
+  } catch (err) {
+    console.error(`[試算表] HWID 重置失敗:`, err.message);
+  }
+}
+
+/**
+ * 從 Google Sheets 載入所有金鑰（Bot 啟動時呼叫）
+ */
+async function loadKeysFromSheet() {
+  try {
+    const url = GOOGLE_SCRIPT_URL + "?action=load_keys";
+    console.log("[試算表] 正在從 Google Sheets 載入金鑰...");
+    const response = await fetch(url, { redirect: "follow" });
+    const text = await response.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      console.error("[試算表] 載入金鑰回應解析失敗:", text.substring(0, 200));
+      return;
+    }
+
+    if (data.status === "ok" && Array.isArray(data.keys)) {
+      let loaded = 0;
+      for (const k of data.keys) {
+        if (k.key && k.user_id) {
+          const keyData = {
+            userId: k.user_id,
+            username: k.username || "unknown",
+            redeemed: k.status === "已兌換" || k.status === "已建立",
+            hwid: k.hwid || null,
+            machineCode: k.machine_code || null,
+            createdAt: k.created_at || k.timestamp || new Date().toISOString()
+          };
+          keyStore.set(k.key, keyData);
+          userKeyMap.set(k.user_id, k.key);
+          loaded++;
+        }
+      }
+      console.log(`[試算表] 已從 Google Sheets 載入 ${loaded} 組金鑰`);
+    } else {
+      console.log("[試算表] 未找到金鑰或格式不符:", data.message || "");
+    }
+  } catch (err) {
+    console.error("[試算表] 載入金鑰失敗:", err.message);
   }
 }
 
@@ -192,7 +300,6 @@ async function registerCommands() {
   ];
 
   const rest = new REST({ version: "10" }).setToken(TOKEN);
-
   try {
     if (GUILD_ID) {
       await rest.put(Routes.applicationGuildCommands(client.user.id, GUILD_ID), { body: commands });
@@ -207,20 +314,22 @@ async function registerCommands() {
 }
 
 // ======================================================================
-// Bot Ready
+// Bot Ready — 載入金鑰 + 發送控制面板
 // ======================================================================
 client.once(Events.ClientReady, async () => {
   console.log(`[Bot] 已登入為 ${client.user.tag}`);
+
+  // 從 Google Sheets 載入所有金鑰（永久儲存）
+  await loadKeysFromSheet();
+
   await registerCommands();
 
   // 在 get key 頻道發送控制面板
   try {
     const channel = await client.channels.fetch(GETKEY_CHANNEL_ID);
     if (channel) {
-      // 檢查是否已有控制面板訊息（避免重複發送）
       const messages = await channel.messages.fetch({ limit: 10 });
       const hasPanel = messages.some(m => m.author.id === client.user.id && m.embeds.length > 0);
-
       if (!hasPanel) {
         await sendControlPanel(channel);
       }
@@ -244,10 +353,11 @@ async function sendControlPanel(channel) {
       `**新用戶**\n` +
       `請前往 <#${DOWNLOAD_CHANNEL_ID}> 下載程式，並使用獲得的金鑰啟動。\n\n` +
       `**使用方式**\n` +
-      `1. 點擊「獲取金鑰」取得您的專屬金鑰\n` +
-      `2. 下載 \`1ynkeycheck.exe\` 啟動器和 \`yy_clicker.exe\` 主程式\n` +
-      `3. 將兩個檔案放在同一資料夾\n` +
-      `4. 開啟 \`1ynkeycheck.exe\`，輸入金鑰即可啟動連點器`
+      `1. 前往 [get 連點key 下載](${DOWNLOAD_LINK}) 下載程式\n` +
+      `2. 將 \`1ynkeycheck.exe\` 和 \`yy_clicker.exe\` 放在同一資料夾\n` +
+      `3. 前往 [get-key](${GETKEY_LINK}) 點選【兌換密鑰】再按下 取得金鑰匙\n` +
+      `4. 開啟 \`1ynkeycheck.exe\`\n` +
+      `5. 輸入 [get-key](${GETKEY_LINK}) 獲得的【金鑰匙】`
     )
     .setFooter({ text: "1yn autogetkey" })
     .setTimestamp();
@@ -255,7 +365,7 @@ async function sendControlPanel(channel) {
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId("btn_redeem_key")
-      .setLabel("兌換金鑰")
+      .setLabel("兌換密鑰")
       .setEmoji("🔑")
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
@@ -284,18 +394,13 @@ async function sendControlPanel(channel) {
 }
 
 // ======================================================================
-// Slash Command 處理
+// Interaction Handler
 // ======================================================================
 client.on(Events.InteractionCreate, async (interaction) => {
-  // ── 防重複處理 ──
-  if (isInteractionProcessed(interaction.id)) {
-    console.log(`[防重複] 已跳過重複互動: ${interaction.id}`);
-    return;
-  }
+  if (isInteractionProcessed(interaction.id)) return;
 
   // ── Slash Command: /giveautoclick ──
   if (interaction.isChatInputCommand() && interaction.commandName === "giveautoclick") {
-    // 權限檢查：管理員或代理
     const member = interaction.member;
     const hasPermission = member.roles.cache.has(ADMIN_ROLE_ID) ||
                           member.roles.cache.has(AGENT_ROLE_ID);
@@ -312,7 +417,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.reply({ content: "❌ 請指定一個使用者。", ephemeral: true });
     }
 
-    // 檢查是否已有金鑰
     if (userKeyMap.has(targetUser.id)) {
       const existingKey = userKeyMap.get(targetUser.id);
       return interaction.reply({
@@ -321,7 +425,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
     }
 
-    // 先回覆管理員（避免 3 秒超時）
     await interaction.deferReply({ ephemeral: true });
 
     // 產生金鑰
@@ -331,11 +434,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       username: targetUser.username,
       redeemed: false,
       hwid: null,
+      machineCode: null,
       createdAt: new Date().toISOString()
     });
     userKeyMap.set(targetUser.id, key);
 
-    // 賦予 autoclick 身分組
+    // 賦予身分組
     try {
       const guild = interaction.guild;
       const targetMember = await guild.members.fetch(targetUser.id);
@@ -344,7 +448,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.error(`[角色] 賦予失敗:`, err.message);
     }
 
-    // 私訊金鑰給目標使用者（只發送一次）
+    // 私訊金鑰（更新後的說明）
     let dmSent = false;
     try {
       const dmEmbed = new EmbedBuilder()
@@ -354,12 +458,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
           `恭喜！管理員已為您分配了一組專屬金鑰。\n\n` +
           `**您的金鑰：**\n\`\`\`\n${key}\n\`\`\`\n\n` +
           `**使用方式：**\n` +
-          `1. 前往 <#${DOWNLOAD_CHANNEL_ID}> 下載程式\n` +
-          `2. 將 \`1ynkeycheck.exe\` 和 \`yy_clicker.exe\` 放在同一資料夾\n` +
-          `3. 開啟 \`1ynkeycheck.exe\`\n` +
-          `4. 輸入上方金鑰即可啟動連點器\n\n` +
+          `前往 [get 連點key 下載](${DOWNLOAD_LINK}) 下載程式\n` +
+          `將 \`1ynkeycheck.exe\` 和 \`yy_clicker.exe\` 放在同一資料夾\n` +
+          `前往 [get-key](${GETKEY_LINK}) 點選【兌換密鑰】再按下 取得金鑰匙\n` +
+          `開啟 \`1ynkeycheck.exe\`\n` +
+          `輸入 [get-key](${GETKEY_LINK}) 獲得的【金鑰匙】\n\n` +
           `⚠ 請妥善保管此金鑰，切勿分享給他人。\n` +
-          `⚠ 金鑰會綁定您的電腦硬體，如需更換電腦請在 Discord 重置 HWID。`
+          `⚠ 金鑰會綁定您的電腦硬體（HWID），如需更換電腦請在 Discord 重置 HWID。\n` +
+          `⚠ 程式首次啟動時會在資料夾中建立 \`checkHWID\` 資料夾，請勿刪除。`
         )
         .setFooter({ text: "1yn autogetkey" })
         .setTimestamp();
@@ -370,23 +476,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.log(`[私訊] 無法私訊 ${targetUser.username}:`, err.message);
     }
 
-    // 寫入 Google 試算表（用戶資料）
-    await sendUserDataToSheet(
-      targetUser.username,
-      targetUser.id,
-      "autoclick（管理員賦予）",
-      "1500 tokens"
-    );
+    // 永久儲存金鑰至 Google Sheets
+    await saveKeyToSheet(key, targetUser.username, targetUser.id, "已建立", "", "");
 
-    // 寫入 Google 試算表（金鑰記錄）
-    await sendKeyDataToSheet(
-      key,
-      targetUser.username,
-      targetUser.id,
-      "已建立"
-    );
+    // 寫入用戶購買資料
+    await sendUserDataToSheet(targetUser.username, targetUser.id, "autoclick（管理員賦予）", "1500 tokens");
 
-    // 回覆管理員（使用 editReply 因為已 defer）
     const replyEmbed = new EmbedBuilder()
       .setColor(0x57F287)
       .setTitle("✅ 金鑰已賦予")
@@ -394,7 +489,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         { name: "使用者", value: `<@${targetUser.id}>`, inline: true },
         { name: "金鑰", value: `\`${key}\``, inline: true },
         { name: "金額", value: "1500 tokens", inline: true },
-        { name: "私訊狀態", value: dmSent ? "✅ 已發送" : "❌ 發送失敗（使用者可能未開啟私訊）", inline: false }
+        { name: "私訊狀態", value: dmSent ? "✅ 已發送" : "❌ 發送失敗", inline: false }
       )
       .setFooter({ text: `由 ${interaction.user.username} 執行` })
       .setTimestamp();
@@ -407,11 +502,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const userId = interaction.user.id;
 
     switch (interaction.customId) {
-      // ── 兌換金鑰 ──
       case "btn_redeem_key": {
         const modal = new ModalBuilder()
           .setCustomId("modal_redeem_key")
-          .setTitle("兌換金鑰");
+          .setTitle("兌換密鑰");
 
         const keyInput = new TextInputBuilder()
           .setCustomId("input_key")
@@ -422,11 +516,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const row = new ActionRowBuilder().addComponents(keyInput);
         modal.addComponents(row);
-
         return interaction.showModal(modal);
       }
 
-      // ── 獲取金鑰 ──
       case "btn_get_key": {
         if (!userKeyMap.has(userId)) {
           return interaction.reply({
@@ -445,11 +537,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
             .setDescription(
               `**金鑰：**\n\`\`\`\n${key}\n\`\`\`\n\n` +
               `**狀態：** ${keyData.redeemed ? "✅ 已兌換" : "⏳ 未兌換"}\n` +
+              `**HWID：** ${keyData.hwid ? "✅ 已綁定" : "⏳ 未綁定"}\n` +
               `**建立時間：** ${keyData.createdAt}\n\n` +
               `**使用方式：**\n` +
-              `1. 將 \`1ynkeycheck.exe\` 和 \`yy_clicker.exe\` 放在同一資料夾\n` +
-              `2. 開啟 \`1ynkeycheck.exe\`\n` +
-              `3. 輸入上方金鑰即可啟動連點器`
+              `前往 [get 連點key 下載](${DOWNLOAD_LINK}) 下載程式\n` +
+              `將 \`1ynkeycheck.exe\` 和 \`yy_clicker.exe\` 放在同一資料夾\n` +
+              `前往 [get-key](${GETKEY_LINK}) 點選【兌換密鑰】再按下 取得金鑰匙\n` +
+              `開啟 \`1ynkeycheck.exe\`\n` +
+              `輸入 [get-key](${GETKEY_LINK}) 獲得的【金鑰匙】`
             )
             .setFooter({ text: "1yn autogetkey" })
             .setTimestamp();
@@ -467,7 +562,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
       }
 
-      // ── 獲取身分組 ──
       case "btn_get_role": {
         if (!userKeyMap.has(userId)) {
           return interaction.reply({
@@ -475,58 +569,43 @@ client.on(Events.InteractionCreate, async (interaction) => {
             ephemeral: true
           });
         }
-
         try {
           const member = await interaction.guild.members.fetch(userId);
           if (member.roles.cache.has(AUTOCLICK_ROLE_ID)) {
-            return interaction.reply({
-              content: "✅ 您已擁有 autoclick 身分組！",
-              ephemeral: true
-            });
+            return interaction.reply({ content: "✅ 您已擁有 autoclick 身分組！", ephemeral: true });
           }
-
           await member.roles.add(AUTOCLICK_ROLE_ID);
-          return interaction.reply({
-            content: "✅ 已成功賦予 autoclick 身分組！",
-            ephemeral: true
-          });
+          return interaction.reply({ content: "✅ 已成功賦予 autoclick 身分組！", ephemeral: true });
         } catch (err) {
-          return interaction.reply({
-            content: "❌ 無法賦予身分組，請聯繫管理員。",
-            ephemeral: true
-          });
+          return interaction.reply({ content: "❌ 無法賦予身分組，請聯繫管理員。", ephemeral: true });
         }
       }
 
-      // ── 重置 HWID ──
       case "btn_reset_hwid": {
         if (!userKeyMap.has(userId)) {
-          return interaction.reply({
-            content: "❌ 您尚未被分配金鑰。",
-            ephemeral: true
-          });
+          return interaction.reply({ content: "❌ 您尚未被分配金鑰。", ephemeral: true });
         }
 
         const key = userKeyMap.get(userId);
         const keyData = keyStore.get(key);
         if (keyData) {
           keyData.hwid = null;
+          keyData.machineCode = null;
           keyStore.set(key, keyData);
         }
 
+        // 同步重置 Google Sheets 中的 HWID
+        await resetHwidOnSheet(key);
+
         return interaction.reply({
-          content: "✅ HWID 已重置！下次啟動程式時將重新綁定。",
+          content: "✅ HWID 已重置！\n\n下次啟動程式時將重新綁定。\n請刪除程式資料夾中的 `checkHWID` 資料夾，然後重新開啟 `1ynkeycheck.exe`。",
           ephemeral: true
         });
       }
 
-      // ── 查看統計 ──
       case "btn_get_stats": {
         if (!userKeyMap.has(userId)) {
-          return interaction.reply({
-            content: "❌ 您尚未被分配金鑰。",
-            ephemeral: true
-          });
+          return interaction.reply({ content: "❌ 您尚未被分配金鑰。", ephemeral: true });
         }
 
         const key = userKeyMap.get(userId);
@@ -538,7 +617,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .addFields(
             { name: "金鑰", value: `\`${key}\``, inline: false },
             { name: "狀態", value: keyData.redeemed ? "✅ 已兌換" : "⏳ 未兌換", inline: true },
-            { name: "HWID", value: keyData.hwid || "未綁定", inline: true },
+            { name: "HWID", value: keyData.hwid ? "✅ 已綁定" : "未綁定", inline: true },
+            { name: "機碼", value: keyData.machineCode ? `\`${keyData.machineCode.substring(0, 16)}...\`` : "未產生", inline: true },
             { name: "建立時間", value: keyData.createdAt, inline: false }
           )
           .setFooter({ text: "1yn autogetkey" })
@@ -549,7 +629,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   }
 
-  // ── Modal 提交：兌換金鑰 ──
+  // ── Modal 提交：兌換密鑰 ──
   if (interaction.isModalSubmit() && interaction.customId === "modal_redeem_key") {
     const inputKey = interaction.fields.getTextInputValue("input_key").trim().toUpperCase();
 
@@ -562,26 +642,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     const keyData = keyStore.get(inputKey);
 
-    // 檢查金鑰是否屬於此使用者
     if (keyData.userId !== interaction.user.id) {
-      return interaction.reply({
-        content: "❌ 此金鑰不屬於您。",
-        ephemeral: true
-      });
+      return interaction.reply({ content: "❌ 此金鑰不屬於您。", ephemeral: true });
     }
 
     if (keyData.redeemed) {
-      return interaction.reply({
-        content: "⚠ 此金鑰已經兌換過了。",
-        ephemeral: true
-      });
+      return interaction.reply({ content: "⚠ 此金鑰已經兌換過了。", ephemeral: true });
     }
 
-    // 標記為已兌換
     keyData.redeemed = true;
     keyStore.set(inputKey, keyData);
 
-    // 賦予身分組
     try {
       const member = await interaction.guild.members.fetch(interaction.user.id);
       await member.roles.add(AUTOCLICK_ROLE_ID);
@@ -589,13 +660,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.error(`[角色] 兌換時賦予失敗:`, err.message);
     }
 
-    // 寫入 Google 試算表
-    await sendUserDataToSheet(
-      interaction.user.username,
-      interaction.user.id,
-      "autoclick（金鑰兌換）",
-      "1500 tokens"
-    );
+    await sendUserDataToSheet(interaction.user.username, interaction.user.id, "autoclick（金鑰兌換）", "1500 tokens");
 
     return interaction.reply({
       content: `✅ 金鑰兌換成功！\n\n您的金鑰：\`${inputKey}\`\n已獲得 autoclick 身分組。\n\n請使用此金鑰在 \`1ynkeycheck.exe\` 啟動器中啟動程式。`,
@@ -610,34 +675,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
 const http = require("http");
 const API_PORT = process.env.PORT || 3000;
 
-// 輔助函式：解析 JSON body
 function parseBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
     req.on("data", chunk => { body += chunk; });
     req.on("end", () => {
-      try {
-        resolve(body ? JSON.parse(body) : {});
-      } catch (e) {
-        resolve({});
-      }
+      try { resolve(body ? JSON.parse(body) : {}); }
+      catch (e) { resolve({}); }
     });
     req.on("error", reject);
   });
 }
 
-// 輔助函式：發送 JSON 回應
 function sendJson(res, statusCode, data) {
   res.writeHead(statusCode, { "Content-Type": "application/json" });
   res.end(JSON.stringify(data));
 }
 
-// 建立 HTTP 伺服器
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const method = req.method;
 
-  // GET /
   if (method === "GET" && url.pathname === "/") {
     return sendJson(res, 200, {
       status: "ok",
@@ -646,57 +704,100 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // GET /health
   if (method === "GET" && url.pathname === "/health") {
     return sendJson(res, 200, { status: "ok", keys_count: keyStore.size });
   }
 
-  // POST /api/verify-key
+  // POST /api/verify-key — 金鑰驗證 + HWID 綁定
   if (method === "POST" && url.pathname === "/api/verify-key") {
     const body = await parseBody(req);
     const { key, hwid } = body;
 
-    console.log(`[API] 收到金鑰驗證請求: key=${key ? key.substring(0, 8) + "..." : "null"}, hwid=${hwid || "null"}`);
+    console.log(`[API] 驗證請求: key=${key ? key.substring(0, 8) + "..." : "null"}, hwid=${hwid ? hwid.substring(0, 16) + "..." : "null"}`);
 
-    if (!key) {
-      return sendJson(res, 400, { valid: false, message: "未提供金鑰" });
-    }
+    if (!key) return sendJson(res, 400, { valid: false, message: "未提供金鑰" });
 
     const normalizedKey = key.trim().toUpperCase();
 
     if (!keyStore.has(normalizedKey)) {
-      console.log(`[API] 金鑰不存在: ${normalizedKey.substring(0, 8)}... (keyStore 大小: ${keyStore.size})`);
+      console.log(`[API] 金鑰不存在 (keyStore: ${keyStore.size})`);
       return sendJson(res, 404, { valid: false, message: "金鑰無效" });
     }
 
     const keyData = keyStore.get(normalizedKey);
 
+    // 加密 HWID
+    const encryptedHwid = hwid ? encryptHWID(hwid) : null;
+
     // HWID 綁定檢查
-    if (keyData.hwid && hwid && keyData.hwid !== hwid) {
+    if (keyData.hwid && encryptedHwid && keyData.hwid !== encryptedHwid) {
       return sendJson(res, 403, {
         valid: false,
         message: "此金鑰已綁定至其他裝置。請在 Discord 重置 HWID。"
       });
     }
 
-    // 如果尚未綁定 HWID，進行綁定
-    if (!keyData.hwid && hwid) {
-      keyData.hwid = hwid;
+    // 首次綁定 HWID
+    if (!keyData.hwid && encryptedHwid) {
+      const mc = generateMachineCode(normalizedKey, encryptedHwid);
+      keyData.hwid = encryptedHwid;
+      keyData.machineCode = mc;
       keyStore.set(normalizedKey, keyData);
-      console.log(`[API] HWID 已綁定: ${normalizedKey.substring(0, 8)}... → ${hwid}`);
-    }
 
-    console.log(`[API] 金鑰驗證成功: ${normalizedKey.substring(0, 8)}... (使用者: ${keyData.username})`);
+      // 同步至 Google Sheets
+      await updateHwidOnSheet(normalizedKey, encryptedHwid, mc);
+      console.log(`[API] HWID 已綁定: ${normalizedKey.substring(0, 8)}...`);
+    }
 
     return sendJson(res, 200, {
       valid: true,
       message: "金鑰驗證成功",
       username: keyData.username,
-      userId: keyData.userId
+      userId: keyData.userId,
+      hwid_hash: keyData.hwid,
+      machine_code: keyData.machineCode
     });
   }
 
-  // GET /api/debug/keys (除錯用，列出所有金鑰數量)
+  // POST /api/verify-hwid — 驗證 checkHWID 資料夾中的機碼
+  if (method === "POST" && url.pathname === "/api/verify-hwid") {
+    const body = await parseBody(req);
+    const { key, hwid_hash, machine_code } = body;
+
+    if (!key || !hwid_hash || !machine_code) {
+      return sendJson(res, 400, { valid: false, message: "缺少必要參數" });
+    }
+
+    const normalizedKey = key.trim().toUpperCase();
+
+    if (!keyStore.has(normalizedKey)) {
+      return sendJson(res, 404, { valid: false, message: "金鑰無效" });
+    }
+
+    const keyData = keyStore.get(normalizedKey);
+
+    // 驗證 HWID 雜湊和機碼是否匹配
+    if (keyData.hwid !== hwid_hash) {
+      return sendJson(res, 403, { valid: false, message: "HWID 不匹配" });
+    }
+
+    if (keyData.machineCode !== machine_code) {
+      return sendJson(res, 403, { valid: false, message: "機碼不匹配" });
+    }
+
+    // 額外驗證機碼的完整性
+    if (!verifyMachineCode(normalizedKey, hwid_hash, machine_code)) {
+      return sendJson(res, 403, { valid: false, message: "機碼驗證失敗" });
+    }
+
+    return sendJson(res, 200, {
+      valid: true,
+      message: "HWID 驗證成功",
+      username: keyData.username
+    });
+  }
+
+  // GET /api/debug/keys
   if (method === "GET" && url.pathname === "/api/debug/keys") {
     const keys = [];
     for (const [key, data] of keyStore.entries()) {
@@ -711,11 +812,9 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, { total: keyStore.size, keys });
   }
 
-  // 404 for all other routes
   sendJson(res, 404, { error: "Not found" });
 });
 
-// 啟動 API 伺服器
 server.listen(API_PORT, "0.0.0.0", () => {
   console.log(`[API] 金鑰驗證伺服器已啟動，監聽 port ${API_PORT}`);
 });
