@@ -11,7 +11,7 @@
  *
  * 環境變數：
  *   - DISCORD_TOKEN        : Bot Token
- *   - GOOGLE_SCRIPT_URL    : Google Apps Script Web App URL（用戶資料）
+ *   - GOOGLE_SCRIPT_URL    : Google Apps Script Web App URL（統一端點）
  *   - GUILD_ID             : 伺服器 ID（用於註冊指令）
  *
  * 頻道/角色 ID：
@@ -69,6 +69,24 @@ const keyStore = new Map();
 const userKeyMap = new Map();
 
 // ======================================================================
+// 防重複互動處理（防止 Discord 重複觸發）
+// ======================================================================
+const processedInteractions = new Set();
+const INTERACTION_EXPIRE_MS = 30000; // 30 秒後清除
+
+function isInteractionProcessed(interactionId) {
+  if (processedInteractions.has(interactionId)) {
+    return true;
+  }
+  processedInteractions.add(interactionId);
+  // 30 秒後自動清除
+  setTimeout(() => {
+    processedInteractions.delete(interactionId);
+  }, INTERACTION_EXPIRE_MS);
+  return false;
+}
+
+// ======================================================================
 // 產生金鑰
 // ======================================================================
 function generateKey() {
@@ -81,7 +99,7 @@ function generateKey() {
 // ======================================================================
 async function sendUserDataToSheet(username, userId, purchaseItem, purchaseAmount) {
   if (!GOOGLE_SCRIPT_URL) {
-    console.log("GOOGLE_SCRIPT_URL 未設定，跳過試算表寫入");
+    console.log("[試算表] GOOGLE_SCRIPT_URL 未設定，跳過寫入");
     return;
   }
 
@@ -94,6 +112,8 @@ async function sendUserDataToSheet(username, userId, purchaseItem, purchaseAmoun
       timestamp: new Date().toISOString()
     };
 
+    console.log(`[試算表] 正在寫入: ${username} (${userId}) — ${purchaseItem}`);
+
     const response = await fetch(GOOGLE_SCRIPT_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -102,9 +122,43 @@ async function sendUserDataToSheet(username, userId, purchaseItem, purchaseAmoun
     });
 
     const result = await response.text();
-    console.log(`[試算表] 已寫入: ${username} (${userId}) — ${purchaseItem} — ${purchaseAmount}`);
+    console.log(`[試算表] 回應: ${result}`);
   } catch (err) {
     console.error(`[試算表] 寫入失敗:`, err.message);
+  }
+}
+
+// ======================================================================
+// 傳送金鑰記錄至 Google 試算表
+// ======================================================================
+async function sendKeyDataToSheet(key, username, userId, status) {
+  if (!GOOGLE_SCRIPT_URL) {
+    console.log("[試算表] GOOGLE_SCRIPT_URL 未設定，跳過金鑰記錄寫入");
+    return;
+  }
+
+  try {
+    const payload = {
+      key,
+      username,
+      user_id: userId,
+      status,
+      timestamp: new Date().toISOString()
+    };
+
+    console.log(`[試算表] 正在寫入金鑰記錄: ${key} → ${username}`);
+
+    const response = await fetch(GOOGLE_SCRIPT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      redirect: "follow"
+    });
+
+    const result = await response.text();
+    console.log(`[試算表] 金鑰記錄回應: ${result}`);
+  } catch (err) {
+    console.error(`[試算表] 金鑰記錄寫入失敗:`, err.message);
   }
 }
 
@@ -191,8 +245,9 @@ async function sendControlPanel(channel) {
       `請前往 <#${DOWNLOAD_CHANNEL_ID}> 下載程式，並使用獲得的金鑰啟動。\n\n` +
       `**使用方式**\n` +
       `1. 點擊「獲取金鑰」取得您的專屬金鑰\n` +
-      `2. 下載 .cmd 啟動器和 .exe 主程式\n` +
-      `3. 開啟 .cmd 檔案，輸入金鑰即可啟動`
+      `2. 下載 \`1ynkeycheck.exe\` 啟動器和 \`yy_clicker.exe\` 主程式\n` +
+      `3. 將兩個檔案放在同一資料夾\n` +
+      `4. 開啟 \`1ynkeycheck.exe\`，輸入金鑰即可啟動連點器`
     )
     .setFooter({ text: "1yn autogetkey" })
     .setTimestamp();
@@ -232,6 +287,12 @@ async function sendControlPanel(channel) {
 // Slash Command 處理
 // ======================================================================
 client.on(Events.InteractionCreate, async (interaction) => {
+  // ── 防重複處理 ──
+  if (isInteractionProcessed(interaction.id)) {
+    console.log(`[防重複] 已跳過重複互動: ${interaction.id}`);
+    return;
+  }
+
   // ── Slash Command: /giveautoclick ──
   if (interaction.isChatInputCommand() && interaction.commandName === "giveautoclick") {
     // 權限檢查：管理員或代理
@@ -260,6 +321,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
     }
 
+    // 先回覆管理員（避免 3 秒超時）
+    await interaction.deferReply({ ephemeral: true });
+
     // 產生金鑰
     const key = generateKey();
     keyStore.set(key, {
@@ -280,7 +344,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.error(`[角色] 賦予失敗:`, err.message);
     }
 
-    // 私訊金鑰給目標使用者
+    // 私訊金鑰給目標使用者（只發送一次）
+    let dmSent = false;
     try {
       const dmEmbed = new EmbedBuilder()
         .setColor(0x57F287)
@@ -289,20 +354,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
           `恭喜！管理員已為您分配了一組專屬金鑰。\n\n` +
           `**您的金鑰：**\n\`\`\`\n${key}\n\`\`\`\n\n` +
           `**使用方式：**\n` +
-          `1. 前往下載頻道取得程式\n` +
-          `2. 開啟 \`.cmd\` 啟動器\n` +
-          `3. 輸入上方金鑰即可啟動 \`.exe\` 連點器\n\n` +
-          `⚠ 請妥善保管此金鑰，切勿分享給他人。`
+          `1. 前往 <#${DOWNLOAD_CHANNEL_ID}> 下載程式\n` +
+          `2. 將 \`1ynkeycheck.exe\` 和 \`yy_clicker.exe\` 放在同一資料夾\n` +
+          `3. 開啟 \`1ynkeycheck.exe\`\n` +
+          `4. 輸入上方金鑰即可啟動連點器\n\n` +
+          `⚠ 請妥善保管此金鑰，切勿分享給他人。\n` +
+          `⚠ 金鑰會綁定您的電腦硬體，如需更換電腦請在 Discord 重置 HWID。`
         )
         .setFooter({ text: "1yn autogetkey" })
         .setTimestamp();
 
       await targetUser.send({ embeds: [dmEmbed] });
+      dmSent = true;
     } catch (err) {
       console.log(`[私訊] 無法私訊 ${targetUser.username}:`, err.message);
     }
 
-    // 寫入 Google 試算表
+    // 寫入 Google 試算表（用戶資料）
     await sendUserDataToSheet(
       targetUser.username,
       targetUser.id,
@@ -310,19 +378,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
       "1500 tokens"
     );
 
-    // 回覆管理員
+    // 寫入 Google 試算表（金鑰記錄）
+    await sendKeyDataToSheet(
+      key,
+      targetUser.username,
+      targetUser.id,
+      "已建立"
+    );
+
+    // 回覆管理員（使用 editReply 因為已 defer）
     const replyEmbed = new EmbedBuilder()
       .setColor(0x57F287)
       .setTitle("✅ 金鑰已賦予")
       .addFields(
         { name: "使用者", value: `<@${targetUser.id}>`, inline: true },
         { name: "金鑰", value: `\`${key}\``, inline: true },
-        { name: "金額", value: "1500 tokens", inline: true }
+        { name: "金額", value: "1500 tokens", inline: true },
+        { name: "私訊狀態", value: dmSent ? "✅ 已發送" : "❌ 發送失敗（使用者可能未開啟私訊）", inline: false }
       )
       .setFooter({ text: `由 ${interaction.user.username} 執行` })
       .setTimestamp();
 
-    return interaction.reply({ embeds: [replyEmbed], ephemeral: true });
+    return interaction.editReply({ embeds: [replyEmbed] });
   }
 
   // ── 按鈕互動 ──
@@ -370,9 +447,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
               `**狀態：** ${keyData.redeemed ? "✅ 已兌換" : "⏳ 未兌換"}\n` +
               `**建立時間：** ${keyData.createdAt}\n\n` +
               `**使用方式：**\n` +
-              `1. 開啟 \`.cmd\` 啟動器\n` +
-              `2. 輸入上方金鑰\n` +
-              `3. 即可啟動 \`.exe\` 連點器`
+              `1. 將 \`1ynkeycheck.exe\` 和 \`yy_clicker.exe\` 放在同一資料夾\n` +
+              `2. 開啟 \`1ynkeycheck.exe\`\n` +
+              `3. 輸入上方金鑰即可啟動連點器`
             )
             .setFooter({ text: "1yn autogetkey" })
             .setTimestamp();
@@ -521,17 +598,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
     );
 
     return interaction.reply({
-      content: `✅ 金鑰兌換成功！\n\n您的金鑰：\`${inputKey}\`\n已獲得 autoclick 身分組。\n\n請使用此金鑰在 .cmd 啟動器中啟動程式。`,
+      content: `✅ 金鑰兌換成功！\n\n您的金鑰：\`${inputKey}\`\n已獲得 autoclick 身分組。\n\n請使用此金鑰在 \`1ynkeycheck.exe\` 啟動器中啟動程式。`,
       ephemeral: true
     });
   }
 });
 
 // ======================================================================
-// 金鑰驗證 API（供 .cmd 腳本呼叫）
+// 金鑰驗證 API（供 C++ 客戶端呼叫）
 // ======================================================================
-// 這個 API 端點讓 C++ 客戶端或 .cmd 腳本可以驗證金鑰
-// 使用 Node.js 內建 http 模組（無需額外安裝 express）
 const http = require("http");
 const API_PORT = process.env.PORT || 3000;
 
@@ -564,18 +639,24 @@ const server = http.createServer(async (req, res) => {
 
   // GET /
   if (method === "GET" && url.pathname === "/") {
-    return sendJson(res, 200, { status: "ok", message: "1yn autogetkey bot is running" });
+    return sendJson(res, 200, {
+      status: "ok",
+      message: "1yn autogetkey bot is running",
+      keys_count: keyStore.size
+    });
   }
 
   // GET /health
   if (method === "GET" && url.pathname === "/health") {
-    return sendJson(res, 200, { status: "ok" });
+    return sendJson(res, 200, { status: "ok", keys_count: keyStore.size });
   }
 
   // POST /api/verify-key
   if (method === "POST" && url.pathname === "/api/verify-key") {
     const body = await parseBody(req);
     const { key, hwid } = body;
+
+    console.log(`[API] 收到金鑰驗證請求: key=${key ? key.substring(0, 8) + "..." : "null"}, hwid=${hwid || "null"}`);
 
     if (!key) {
       return sendJson(res, 400, { valid: false, message: "未提供金鑰" });
@@ -584,6 +665,7 @@ const server = http.createServer(async (req, res) => {
     const normalizedKey = key.trim().toUpperCase();
 
     if (!keyStore.has(normalizedKey)) {
+      console.log(`[API] 金鑰不存在: ${normalizedKey.substring(0, 8)}... (keyStore 大小: ${keyStore.size})`);
       return sendJson(res, 404, { valid: false, message: "金鑰無效" });
     }
 
@@ -601,7 +683,10 @@ const server = http.createServer(async (req, res) => {
     if (!keyData.hwid && hwid) {
       keyData.hwid = hwid;
       keyStore.set(normalizedKey, keyData);
+      console.log(`[API] HWID 已綁定: ${normalizedKey.substring(0, 8)}... → ${hwid}`);
     }
+
+    console.log(`[API] 金鑰驗證成功: ${normalizedKey.substring(0, 8)}... (使用者: ${keyData.username})`);
 
     return sendJson(res, 200, {
       valid: true,
@@ -609,6 +694,21 @@ const server = http.createServer(async (req, res) => {
       username: keyData.username,
       userId: keyData.userId
     });
+  }
+
+  // GET /api/debug/keys (除錯用，列出所有金鑰數量)
+  if (method === "GET" && url.pathname === "/api/debug/keys") {
+    const keys = [];
+    for (const [key, data] of keyStore.entries()) {
+      keys.push({
+        key_prefix: key.substring(0, 8) + "...",
+        username: data.username,
+        redeemed: data.redeemed,
+        hwid: data.hwid ? "已綁定" : "未綁定",
+        createdAt: data.createdAt
+      });
+    }
+    return sendJson(res, 200, { total: keyStore.size, keys });
   }
 
   // 404 for all other routes
