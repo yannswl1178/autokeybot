@@ -689,9 +689,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const licenseKey = userLicenseMap.get(userId);
         const licenseData = licenseStore.get(licenseKey);
+
+        // 12 小時冷卻機制
+        if (licenseData && licenseData.lastHwidReset) {
+          const cooldownMs = 12 * 60 * 60 * 1000; // 12 小時
+          const elapsed = Date.now() - new Date(licenseData.lastHwidReset).getTime();
+          if (elapsed < cooldownMs) {
+            const remainMs = cooldownMs - elapsed;
+            const remainH = Math.floor(remainMs / (60 * 60 * 1000));
+            const remainM = Math.ceil((remainMs % (60 * 60 * 1000)) / (60 * 1000));
+            return interaction.reply({
+              content: `⏳ HWID 重置冷卻中！\n\n距離下次可重置還需 **${remainH} 小時 ${remainM} 分鐘**。\n（每 12 小時只能重置一次）`,
+              ephemeral: true
+            });
+          }
+        }
+
         if (licenseData) {
           licenseData.hwid = null;
           licenseData.machineCode = null;
+          licenseData.sessionToken = null;
+          licenseData.lastHwidReset = new Date().toISOString();
           licenseStore.set(licenseKey, licenseData);
         }
 
