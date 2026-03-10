@@ -631,36 +631,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const licenseKey = userLicenseMap.get(userId);
         const licenseData = licenseStore.get(licenseKey);
 
-        try {
-          const dmEmbed = new EmbedBuilder()
-            .setColor(0x5865F2)
-            .setTitle("🔑 您的 1yn AutoClick 金鑰")
-            .setDescription(
-              `**金鑰（用於 1ynkeycheck.exe）：**\n\`\`\`\n${licenseKey}\n\`\`\`\n\n` +
-              `**HWID：** ${licenseData.hwid ? "✅ 已綁定" : "⏳ 未綁定"}\n` +
-              `**建立時間：** ${licenseData.createdAt}\n\n` +
-              `**使用方式：**\n` +
-              `前往 ${DOWNLOAD_LINK} 下載程式\n` +
-              `將 \`1ynkeycheck.exe\` 和 \`yy_clicker.exe\` 放在同一資料夾\n` +
-              `開啟 \`1ynkeycheck.exe\`\n` +
-              `輸入上方的【金鑰】即可啟動\n\n` +
-              `⚠ 請妥善保管此金鑰，切勿分享給他人。\n` +
-              `⚠ 金鑰會綁定您的電腦硬體（HWID），如需更換電腦請在 Discord 重置 HWID。`
-            )
-            .setFooter({ text: "1yn autogetkey" })
-            .setTimestamp();
+        // 直接以 ephemeral 回覆顯示金鑰（僅用戶可見）
+        const keyEmbed = new EmbedBuilder()
+          .setColor(0x5865F2)
+          .setTitle("🔑 您的 1yn AutoClick 金鑰")
+          .setDescription(
+            `**金鑰（用於 1ynkeycheck.exe）：**\n\`\`\`\n${licenseKey}\n\`\`\`\n\n` +
+            `**HWID：** ${licenseData.hwid ? "✅ 已綁定" : "⏳ 未綁定"}\n` +
+            `**建立時間：** ${licenseData.createdAt}\n\n` +
+            `**使用方式：**\n` +
+            `前往 ${DOWNLOAD_LINK} 下載程式\n` +
+            `將 \`1ynkeycheck.exe\` 和 \`yy_clicker.exe\` 放在同一資料夾\n` +
+            `開啟 \`1ynkeycheck.exe\`\n` +
+            `輸入上方的【金鑰】即可啟動\n\n` +
+            `⚠ 請妥善保管此金鑰，切勿分享給他人。\n` +
+            `⚠ 金鑰會綁定您的電腦硬體（HWID），如需更換電腦請在 Discord 重置 HWID。`
+          )
+          .setFooter({ text: "1yn autogetkey" })
+          .setTimestamp();
 
-          await interaction.user.send({ embeds: [dmEmbed] });
-          return interaction.reply({
-            content: "✅ 金鑰已透過私訊發送給您，請查看私訊！",
-            ephemeral: true
-          });
-        } catch (err) {
-          return interaction.reply({
-            content: `❌ 無法發送私訊。請確認您已開啟私訊功能。\n\n您的金鑰：\`${licenseKey}\``,
-            ephemeral: true
-          });
-        }
+        return interaction.reply({
+          embeds: [keyEmbed],
+          ephemeral: true
+        });
       }
 
       case "btn_get_role": {
@@ -716,7 +709,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await resetHwidOnSheet(licenseKey);
 
         return interaction.reply({
-          content: "✅ HWID 已重置！\n\n下次啟動程式時將重新綁定。\n請刪除程式資料夾中的 `checkHWID` 資料夾，然後重新開啟 `1ynkeycheck.exe`。",
+          content: "✅ HWID 已重置！\n\n# 每 12 小時只能重置一次\n\n下次啟動程式時將重新綁定。\n請刪除程式資料夾中的 `checkHWID` 資料夾，然後重新開啟 `1ynkeycheck.exe`。",
           ephemeral: true
         });
       }
@@ -751,6 +744,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   // ── Modal 提交：兌換密鑰 ──
   if (interaction.isModalSubmit() && interaction.customId === "modal_redeem_key") {
+    // 立即 deferReply 避免互動逾時導致用戶重試產生重複日誌
+    await interaction.deferReply({ ephemeral: true });
+
     const rawInput = interaction.fields.getTextInputValue("input_key");
     const inputKey = rawInput.trim().toUpperCase().replace(/\s+/g, "");
 
@@ -772,23 +768,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (!actualSecretKey) {
       console.log(`[兌換] 密鑰不存在。secretStore: ${[...secretStore.keys()].map(k => k.substring(0, 12) + "...").join(", ")}`);
-      return interaction.reply({
-        content: "❌ 密鑰無效！請確認您輸入的密鑰是否正確。",
-        ephemeral: true
+      return interaction.editReply({
+        content: "❌ 密鑰無效！請確認您輸入的密鑰是否正確。"
       });
     }
 
     const secretData = secretStore.get(actualSecretKey);
 
     if (secretData.userId !== interaction.user.id) {
-      return interaction.reply({ content: "❌ 此密鑰不屬於您。", ephemeral: true });
+      return interaction.editReply({ content: "❌ 此密鑰不屬於您。" });
     }
 
     if (secretData.redeemed) {
       // 已兌換過，告知用戶去按【獲取金鑰】
-      return interaction.reply({
-        content: "⚠ 此密鑰已經兌換過了。請點擊【獲取金鑰】按鈕來取得您的程式金鑰。",
-        ephemeral: true
+      return interaction.editReply({
+        content: "⚠ 此密鑰已經兌換過了。請點擊【獲取金鑰】按鈕來取得您的程式金鑰。"
       });
     }
 
@@ -819,15 +813,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.error(`[角色] 兌換時賦予失敗:`, err.message);
     }
 
-    // 更新 Google Sheets
+    // 更新 Google Sheets（僅儲存金鑰資料，不重複寫入用戶資料）
     await saveKeysToSheet(actualSecretKey, licenseKey, interaction.user.username, interaction.user.id, "已兌換", "", "");
-    await sendUserDataToSheet(interaction.user.username, interaction.user.id, "autoclick（密鑰兌換）", "1500 tokens");
 
     console.log(`[兌換] 成功！密鑰=${actualSecretKey}, 金鑰=${licenseKey}, 用戶=${interaction.user.username}`);
 
-    return interaction.reply({
-      content: `✅ 密鑰兌換成功！\n\n已獲得 autoclick 身分組。\n\n請點擊【獲取金鑰】按鈕來取得您的程式啟動金鑰。`,
-      ephemeral: true
+    return interaction.editReply({
+      content: `✅ 密鑰兌換成功！\n\n已獲得 autoclick 身分組。\n\n請點擊【獲取金鑰】按鈕來取得您的程式啟動金鑰。`
     });
   }
 });
