@@ -313,8 +313,8 @@ async function loadKeysFromSheet() {
       for (const k of data.keys) {
         if (!k.user_id) continue;
 
-        const sKey = k.secret_key || k.key || "";
-        const lKey = k.license_key || "";
+        const sKey = (k.secret_key || k.key || "").trim();
+        const lKey = (k.license_key || "").trim().toUpperCase();
         const userId = k.user_id;
         const username = k.username || "unknown";
         const redeemed = k.status === "已兌換";
@@ -1043,8 +1043,18 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (!licenseStore.has(normalizedKey)) {
-      console.log(`[API] 金鑰不存在 (licenseStore: ${licenseStore.size})`);
-      return sendJson(res, 404, { valid: false, message: "金鑰無效" });
+      // 金鑰不在記憶體中 → 嘗試從 Google Sheets 重新載入
+      console.log(`[API] 金鑰不存在於記憶體 (licenseStore: ${licenseStore.size})，嘗試重新載入...`);
+      try {
+        await loadKeysFromSheet();
+      } catch (e) {
+        console.error("[API] 重新載入失敗:", e.message);
+      }
+      if (!licenseStore.has(normalizedKey)) {
+        console.log(`[API] 重新載入後仍找不到金鑰 (licenseStore: ${licenseStore.size})`);
+        return sendJson(res, 404, { valid: false, message: "金鑰無效" });
+      }
+      console.log(`[API] 重新載入後找到金鑰`);
     }
 
     const licenseData = licenseStore.get(normalizedKey);
@@ -1093,21 +1103,53 @@ const server = http.createServer(async (req, res) => {
     const normalizedKey = key.trim().toUpperCase();
 
     if (!licenseStore.has(normalizedKey)) {
-      return sendJson(res, 404, { valid: false, message: "金鑰無效" });
+      // 嘗試從 Google Sheets 重新載入
+      console.log(`[API] verify-hwid: 金鑰不存在於記憶體，嘗試重新載入...`);
+      try {
+        await loadKeysFromSheet();
+      } catch (e) {
+        console.error("[API] 重新載入失敗:", e.message);
+      }
+      if (!licenseStore.has(normalizedKey)) {
+        return sendJson(res, 404, { valid: false, message: "金鑰無效" });
+      }
     }
 
     const licenseData = licenseStore.get(normalizedKey);
 
+    // HWID 已重置（null）→ 重新綁定
+    if (!licenseData.hwid) {
+      // 驗證 machine_code 有效性
+      if (!verifyMachineCode(normalizedKey, hwid_hash, machine_code)) {
+        return sendJson(res, 403, { valid: false, message: "\u6A5F\u78BC\u9A57\u8B49\u5931\u6557" });
+      }
+      // 重新綁定 HWID
+      licenseData.hwid = hwid_hash;
+      licenseData.machineCode = machine_code;
+      if (session_token) licenseData.sessionToken = session_token;
+      licenseStore.set(normalizedKey, licenseData);
+      await updateHwidOnSheet(normalizedKey, hwid_hash, machine_code);
+      if (session_token) {
+        await updateSessionOnSheet(normalizedKey, hwid_hash, machine_code, session_token);
+      }
+      console.log(`[API] HWID \u5DF2\u91CD\u65B0\u7D81\u5B9A (verify-hwid): ${normalizedKey.substring(0, 8)}...`);
+      return sendJson(res, 200, {
+        valid: true,
+        message: "HWID \u5DF2\u91CD\u65B0\u7D81\u5B9A",
+        username: licenseData.username
+      });
+    }
+
     if (licenseData.hwid !== hwid_hash) {
-      return sendJson(res, 403, { valid: false, message: "HWID 不匹配" });
+      return sendJson(res, 403, { valid: false, message: "HWID \u4E0D\u5339\u914D" });
     }
 
     if (licenseData.machineCode !== machine_code) {
-      return sendJson(res, 403, { valid: false, message: "機碼不匹配" });
+      return sendJson(res, 403, { valid: false, message: "\u6A5F\u78BC\u4E0D\u5339\u914D" });
     }
 
     if (!verifyMachineCode(normalizedKey, hwid_hash, machine_code)) {
-      return sendJson(res, 403, { valid: false, message: "機碼驗證失敗" });
+      return sendJson(res, 403, { valid: false, message: "\u6A5F\u78BC\u9A57\u8B49\u5931\u6557" });
     }
 
     // Session Token 驗證（如果伺服器端有存 session_token）
