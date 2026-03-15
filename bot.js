@@ -239,6 +239,32 @@ async function resetHwidOnSheet(licenseKey) {
 }
 
 /**
+ * 從 Google Sheets 刪除指定用戶的金鑰記錄
+ */
+async function deleteKeysFromSheet(secretKey, licenseKey, userId) {
+  try {
+    const payload = {
+      type: "key_delete",
+      secret_key: secretKey || "",
+      license_key: licenseKey || "",
+      user_id: userId,
+      timestamp: new Date().toISOString()
+    };
+    console.log(`[試算表] 刪除金鑰: user=${userId}, secret=${secretKey ? secretKey.substring(0, 8) + "..." : "N/A"}, license=${licenseKey ? licenseKey.substring(0, 8) + "..." : "N/A"}`);
+    const response = await fetch(GOOGLE_SCRIPT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      redirect: "follow"
+    });
+    const result = await response.text();
+    console.log(`[試算表] 刪除金鑰回應: ${result}`);
+  } catch (err) {
+    console.error(`[試算表] 刪除金鑰失敗:`, err.message);
+  }
+}
+
+/**
  * 更新 session_token 至 Google Sheets
  */
 async function updateSessionOnSheet(licenseKey, encryptedHwid, machineCode, sessionToken) {
@@ -379,6 +405,24 @@ async function registerCommands() {
     new SlashCommandBuilder()
       .setName("setup")
       .setDescription("重新發送控制面板至 get-key 頻道（管理員專用）")
+      .toJSON(),
+    new SlashCommandBuilder()
+      .setName("removekey")
+      .setDescription("移除指定使用者的金鑰匙和密鑰（管理員專用）")
+      .addUserOption(option =>
+        option.setName("使用者")
+          .setDescription("要移除金鑰的使用者")
+          .setRequired(true)
+      )
+      .toJSON(),
+    new SlashCommandBuilder()
+      .setName("listkeys")
+      .setDescription("顯示指定使用者擁有的金鑰匙資訊（管理員專用）")
+      .addUserOption(option =>
+        option.setName("使用者")
+          .setDescription("要查詢的使用者")
+          .setRequired(true)
+      )
       .toJSON()
   ];
 
@@ -588,6 +632,117 @@ client.on(Events.InteractionCreate, async (interaction) => {
       .setTimestamp();
 
     return interaction.editReply({ embeds: [replyEmbed] });
+  }
+
+  // ── Slash Command: /removekey ──
+  if (interaction.isChatInputCommand() && interaction.commandName === "removekey") {
+    const member = interaction.member;
+    if (!member.roles.cache.has(ADMIN_ROLE_ID)) {
+      return interaction.reply({
+        content: "\u274C 您沒有權限使用此指令。僅限管理員使用。",
+        ephemeral: true
+      });
+    }
+
+    const targetUser = interaction.options.getUser("使用者");
+    if (!targetUser) {
+      return interaction.reply({ content: "\u274C 請指定一個使用者。", ephemeral: true });
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    const userId = targetUser.id;
+    const secretKey = userSecretMap.get(userId) || null;
+    const licenseKey = userLicenseMap.get(userId) || null;
+
+    if (!secretKey && !licenseKey) {
+      return interaction.editReply({
+        content: `\u274C 使用者 <@${userId}> 沒有任何金鑰或密鑰記錄。`
+      });
+    }
+
+    // 從記憶體中移除
+    if (secretKey) {
+      secretStore.delete(secretKey);
+      userSecretMap.delete(userId);
+    }
+    if (licenseKey) {
+      licenseStore.delete(licenseKey);
+      userLicenseMap.delete(userId);
+    }
+
+    // 從 Google Sheets 中刪除
+    await deleteKeysFromSheet(secretKey, licenseKey, userId);
+
+    // 移除身分組
+    try {
+      const guildMember = await interaction.guild.members.fetch(userId);
+      if (guildMember.roles.cache.has(AUTOCLICK_ROLE_ID)) {
+        await guildMember.roles.remove(AUTOCLICK_ROLE_ID);
+      }
+    } catch (err) {
+      console.error(`[角色] 移除失敗:`, err.message);
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor(0xED4245)
+      .setTitle("\u{1F5D1}\uFE0F 金鑰已移除")
+      .addFields(
+        { name: "使用者", value: `<@${userId}>`, inline: true },
+        { name: "密鑰", value: secretKey ? `\`${secretKey}\`` : "（無）", inline: true },
+        { name: "金鑰", value: licenseKey ? `\`${licenseKey}\`` : "（無）", inline: true }
+      )
+      .setFooter({ text: `由 ${interaction.user.username} 執行` })
+      .setTimestamp();
+
+    console.log(`[removekey] 已移除 ${targetUser.username} (${userId}) 的所有金鑰`);
+    return interaction.editReply({ embeds: [embed] });
+  }
+
+  // ── Slash Command: /listkeys ──
+  if (interaction.isChatInputCommand() && interaction.commandName === "listkeys") {
+    const member = interaction.member;
+    if (!member.roles.cache.has(ADMIN_ROLE_ID)) {
+      return interaction.reply({
+        content: "\u274C 您沒有權限使用此指令。僅限管理員使用。",
+        ephemeral: true
+      });
+    }
+
+    const targetUser = interaction.options.getUser("使用者");
+    if (!targetUser) {
+      return interaction.reply({ content: "\u274C 請指定一個使用者。", ephemeral: true });
+    }
+
+    const userId = targetUser.id;
+    const secretKey = userSecretMap.get(userId) || null;
+    const licenseKey = userLicenseMap.get(userId) || null;
+
+    if (!secretKey && !licenseKey) {
+      return interaction.reply({
+        content: `\u274C 使用者 <@${userId}> 沒有任何金鑰或密鑰記錄。`,
+        ephemeral: true
+      });
+    }
+
+    const secretData = secretKey ? secretStore.get(secretKey) : null;
+    const licenseData = licenseKey ? licenseStore.get(licenseKey) : null;
+
+    const embed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle(`\u{1F511} ${targetUser.username} 的金鑰資訊`)
+      .addFields(
+        { name: "密鑰（Secret Key）", value: secretKey ? `\`${secretKey}\`` : "（無）", inline: false },
+        { name: "金鑰（License Key）", value: licenseKey ? `\`${licenseKey}\`` : "（尚未兌換）", inline: false },
+        { name: "兌換狀態", value: secretData && secretData.redeemed ? "\u2705 已兌換" : "\u23F3 未兌換", inline: true },
+        { name: "HWID", value: licenseData && licenseData.hwid ? "\u2705 已綁定" : "\u26A0 未綁定", inline: true },
+        { name: "Session Token", value: licenseData && licenseData.sessionToken ? "\u2705 已設定" : "\u26A0 未設定", inline: true },
+        { name: "建立時間", value: secretData ? secretData.createdAt : (licenseData ? licenseData.createdAt : "未知"), inline: false }
+      )
+      .setFooter({ text: `查詢者: ${interaction.user.username}` })
+      .setTimestamp();
+
+    return interaction.reply({ embeds: [embed], ephemeral: true });
   }
 
   // ── 按鈕互動 ──
